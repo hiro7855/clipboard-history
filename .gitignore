@@ -10,7 +10,7 @@ data/
 # Build artifacts
 build/
 dist/
-*.spec
+*.exe
 
 # IDE
 .vscode/

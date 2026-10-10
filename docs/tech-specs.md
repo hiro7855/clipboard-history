@@ -1,5 +1,7 @@
 # 技术规格说明
 
+> v1.2.0：剪贴板以dataChanged通知触发，序列号校验且有1秒补偿检查；图片content保存原图PNG的base64，thumbnail独立保存200px预览。clips追加thumbnail/width/height/byte_size/image_original/content_hash列，迁移保留既有内容。列表每页60条，只查询缩略图和有限文本，完整内容按需读取。SQLite增量回收与WAL检查点定时执行。设置以临时文件原子替换。应用仍集中main.py，tests/test_iteration.py使用临时数据回归。
+
 ## 1. 技术栈
 
 | 层级 | 技术 | 版本要求 |

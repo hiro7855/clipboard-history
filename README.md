@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/Python-3.14-blue.svg)](https://www.python.org/)
 [![PySide6](https://img.shields.io/badge/PySide6-6.11-green.svg)](https://pypi.org/project/PySide6/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011-lightgrey.svg)]()
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)]()
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## 项目简介
 
@@ -56,6 +56,12 @@
 
 ## 快速开始
 
+### 方式一：直接下载（推荐）
+
+到 [Releases](https://github.com/hiro7855/clipboard-history/releases/latest) 下载 `ClipboardHistory.exe`，双击即可运行，无需安装 Python。程序未做代码签名，Windows 可能提示"未知发布者"，可对照 Release 页面给出的 SHA-256 校验文件后再运行。
+
+### 方式二：源码运行
+
 环境：Windows 10 / 11，Python 3.14。
 
 ```bash
@@ -65,7 +71,7 @@ python main.py
 
 启动后图标会出现在系统托盘，像平时一样 `Ctrl+C` 复制即可，按 `Alt+V` 呼出历史。
 
-打包为免安装的单文件 exe：
+打包为免安装的单文件 exe（自行构建时）：
 
 ```bash
 pip install pyinstaller
@@ -163,4 +169,4 @@ clipboard-history/
 
 ## License
 
-MIT © 2026
+[MIT](LICENSE) © 2026 hiro7855

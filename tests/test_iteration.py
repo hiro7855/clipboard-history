@@ -6,6 +6,9 @@ import unittest
 import importlib.util
 from pathlib import Path
 from unittest.mock import patch
+from PySide6.QtCore import QPointF
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtTest import QTest
 
 TASK_DIR = tempfile.TemporaryDirectory()
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
@@ -275,6 +278,242 @@ class IterationTests(unittest.TestCase):
         with patch.object(m.os,'replace',side_effect=OSError('read-only synthetic path')):
             with self.assertRaises(OSError): self.settings.set('paused',not original)
         self.assertEqual(self.settings.get('paused'),original)
+
+    def test_close_button_asks_before_quitting_and_cancel_keeps_running(self):
+        window=TestWindow(self.db,self.settings)
+        window.show()
+        app.processEvents()
+        self.assertIn('退出',window.close_btn.accessibleName())
+        with patch.object(window,'_confirm_quit',return_value=False), patch.object(m.QApplication,'quit') as quit_app:
+            window.close_btn.click()
+            quit_app.assert_not_called()
+        self.assertTrue(window.isVisible())
+        with patch.object(window,'_confirm_quit',return_value=True), patch.object(m.QApplication,'quit') as quit_app:
+            window.close_btn.click()
+            quit_app.assert_called_once()
+        window.close()
+
+    def test_quit_prompt_warns_recording_stops_and_defaults_to_cancel(self):
+        window=TestWindow(self.db,self.settings)
+        captured={}
+        def fake_exec(box):
+            captured['text']=box.text()
+            captured['default']=box.defaultButton().text()
+            captured['buttons']=[button.text() for button in box.buttons()]
+            return 0
+        with patch.object(m.QMessageBox,'exec',fake_exec):
+            self.assertFalse(window._confirm_quit())
+        self.assertIn('不再记录',captured['text'])
+        self.assertEqual(captured['default'],'取消')
+        self.assertEqual(sorted(captured['buttons']),['取消','退出'])
+        def click_quit(box):
+            next(button for button in box.buttons() if button.text()=='退出').click()
+            return 0
+        with patch.object(m.QMessageBox,'exec',click_quit):
+            self.assertTrue(window._confirm_quit())
+        window.close()
+
+    def test_single_click_on_tray_icon_toggles_and_double_click_is_not_repeated(self):
+        window=TestWindow(self.db,self.settings)
+        calls=[]
+        window._toggle_from_tray=lambda: calls.append(1)
+        tray=m.create_tray_icon(app,window)
+        tray.activated.emit(m.QSystemTrayIcon.Trigger)
+        self.assertEqual(len(calls),1)
+        tray.activated.emit(m.QSystemTrayIcon.DoubleClick)
+        tray.activated.emit(m.QSystemTrayIcon.MiddleClick)
+        self.assertEqual(len(calls),1)
+        self.assertIn('单击',tray.toolTip())
+        tray.hide()
+        window.close()
+
+    def test_minimize_button_docks_and_keeps_data(self):
+        self.db.insert('text','keep me')
+        window=TestWindow(self.db,self.settings)
+        window.show()
+        app.processEvents()
+        self.assertEqual(window.minimize_btn.accessibleName()[:3],'最小化')
+        window.minimize_btn.click()
+        self.assertFalse(window.isVisible())
+        self.assertEqual(self.db.get_count(),1)
+        window.close()
+
+    def _foreground_pid(self, pid):
+        def fake(hwnd, ref):
+            ref._obj.value = pid
+        return patch.object(m._user32, 'GetWindowThreadProcessId', side_effect=fake)
+
+    def test_unpinned_click_elsewhere_auto_docks_but_pinned_modal_and_own_windows_do_not(self):
+        window=TestWindow(self.db,self.settings)
+        window.pinned=False
+        window.show()
+        app.processEvents()
+        window._was_active=True
+        other=m.os.getpid()+1
+        with patch.object(window,'isActiveWindow',return_value=False), self._foreground_pid(m.os.getpid()):
+            window._dock_if_deactivated()                 # 前台是本程序自己的窗口：不动
+        self.assertTrue(window.isVisible())
+        with patch.object(window,'isActiveWindow',return_value=True), self._foreground_pid(other):
+            window._dock_if_deactivated()                 # 已重新激活：不动
+        self.assertTrue(window.isVisible())
+        with patch.object(window,'isActiveWindow',return_value=False), self._foreground_pid(other), patch.object(m.QApplication,'activeModalWidget',return_value=window):
+            window._dock_if_deactivated()                 # 有模态对话框：不动
+        self.assertTrue(window.isVisible())
+        window.pinned=True
+        with patch.object(window,'isActiveWindow',return_value=False), self._foreground_pid(other):
+            window._dock_if_deactivated()                 # 保持显示：不动
+        self.assertTrue(window.isVisible())
+        window.pinned=False
+        with patch.object(window,'isActiveWindow',return_value=False), self._foreground_pid(other):
+            window._dock_if_deactivated()
+        self.assertFalse(window.isVisible())
+        self.assertTrue(window._docked)
+        self.assertEqual(window._dock_mode,'min')
+        self._wait_dock(window)
+        self.assertTrue(window.dock_tab.isVisible())
+        window.close()
+
+    def test_deactivation_event_only_schedules_dock_after_window_was_active(self):
+        window=TestWindow(self.db,self.settings)
+        window.pinned=False
+        window.show()
+        app.processEvents()
+        with patch.object(window,'isActiveWindow',return_value=False), patch.object(window,'_dock_if_deactivated') as check:
+            window._was_active=False
+            window.changeEvent(m.QEvent(m.QEvent.ActivationChange))
+            QTest.qWait(150)
+            check.assert_not_called()                     # 从没激活过（如激活被系统拒绝）不应自动收起
+            window._was_active=True
+            window.changeEvent(m.QEvent(m.QEvent.ActivationChange))
+            QTest.qWait(150)
+            check.assert_called_once()
+        window.close()
+
+    def test_hotkey_docks_active_or_pinned_window_and_raises_inactive_one(self):
+        window=TestWindow(self.db,self.settings)
+        window.pinned=False
+        window.show()
+        app.processEvents()
+        with patch.object(window,'isActiveWindow',return_value=False), patch.object(window,'_show_front') as front:
+            window._toggle_show()
+            front.assert_called_once()
+        self.assertTrue(window.isVisible())
+        with patch.object(window,'isActiveWindow',return_value=True):
+            window._toggle_show()
+        self.assertFalse(window.isVisible())
+        self.assertTrue(window._docked)
+        self._wait_dock(window)
+        window._toggle_show()                             # 已停靠：Alt+V 展开
+        self.assertEqual(window._dock_mode,'expand')
+        self._wait_dock(window)
+        self.assertTrue(window.isVisible())
+        window.pinned=True
+        with patch.object(window,'isActiveWindow',return_value=False):
+            window._toggle_show()
+        self.assertFalse(window.isVisible())
+        self.assertTrue(window._docked)
+        window.close()
+
+    def test_escape_and_tray_minimize_to_dock_and_tray_ignores_click_that_just_auto_docked(self):
+        window=TestWindow(self.db,self.settings)
+        window.show()
+        app.processEvents()
+        escape=[sc for sc in window.findChildren(m.QShortcut) if sc.key()==m.QKeySequence(m.Qt.Key_Escape)]
+        self.assertEqual(len(escape),1)
+        escape[0].activated.emit()
+        self.assertTrue(window._docked)
+        self.assertFalse(window.isVisible())
+        self._wait_dock(window)
+        window._toggle_from_tray()                        # 已停靠：托盘单击展开
+        self.assertEqual(window._dock_mode,'expand')
+        self._wait_dock(window)
+        self.assertTrue(window.isVisible())
+        window._toggle_from_tray()                        # 看得见：托盘单击收进标签
+        self.assertTrue(window._docked)
+        self._wait_dock(window)
+        window._toggle_from_tray()
+        self._wait_dock(window)
+        self.assertTrue(window.isVisible())
+        window._auto_docked_at=m.time.monotonic()         # 点托盘瞬间已因失去激活自动收起
+        window._minimize_to_dock()
+        self._wait_dock(window)
+        window._toggle_from_tray()
+        self.assertFalse(window.isVisible())
+        self.assertTrue(window._docked)
+        window.close()
+
+    def _wait_dock(self, window, timeout=3000):
+        deadline = m.time.time() + timeout / 1000
+        while window._dock_mode and m.time.time() < deadline:
+            app.processEvents()
+        app.processEvents()
+
+    def test_minimize_docks_to_right_edge_tab_and_click_expands_with_animation(self):
+        self.db.insert('text','keep me')
+        window=TestWindow(self.db,self.settings)
+        window.show()
+        app.processEvents()
+        window.minimize_btn.click()
+        self.assertFalse(window.isVisible())          # 窗口立即让位给缩放动画
+        self.assertEqual(window._dock_mode,'min')
+        self.assertTrue(window._scale_overlay.isVisible())
+        self._wait_dock(window)
+        avail=app.primaryScreen().availableGeometry()
+        self.assertTrue(window.dock_tab.isVisible())
+        self.assertFalse(window._scale_overlay.isVisible())
+        self.assertEqual(window.dock_tab.geometry().right()+1,avail.right()+1)
+        self.assertEqual(self.db.get_count(),1)
+        window.dock_tab.clicked.emit()
+        self.assertEqual(window._dock_mode,'expand')
+        window._show_front()                          # 展开途中重复呼出不应重入
+        self.assertEqual(window._dock_mode,'expand')
+        self._wait_dock(window)
+        self.assertTrue(window.isVisible())
+        self.assertFalse(window.dock_tab.isVisible())
+        self.assertFalse(window._docked)
+        QTest.qWait(120)                            # 真实窗口出现后才撤掉截图
+        self.assertFalse(window._scale_overlay.isVisible())
+        window.close()
+
+    def test_hotkey_or_tray_while_docked_expands_and_interrupts_minimize(self):
+        window=TestWindow(self.db,self.settings)
+        window.show()
+        app.processEvents()
+        window.minimize_btn.click()
+        window._toggle_show()                         # 收起动画途中被呼出：立即还原
+        self.assertTrue(window.isVisible())
+        self.assertIsNone(window._dock_mode)
+        self.assertFalse(window.dock_tab.isVisible())
+        self.assertFalse(window._scale_overlay.isVisible())
+        window.minimize_btn.click()
+        self._wait_dock(window)
+        window._toggle_from_tray()                    # 已停靠时托盘单击也走展开动画
+        self.assertEqual(window._dock_mode,'expand')
+        self._wait_dock(window)
+        self.assertTrue(window.isVisible())
+        window.close()
+
+    def test_dock_tab_drag_remembers_position_and_stays_on_screen(self):
+        window=TestWindow(self.db,self.settings)
+        window.show()
+        window.minimize_btn.click()
+        self._wait_dock(window)
+        tab=window.dock_tab
+        start=tab.geometry().center()
+        def send(kind, y, button=m.Qt.LeftButton):
+            event=QMouseEvent(kind,QPointF(5,40),QPointF(start.x(),y),button,button,m.Qt.NoModifier)
+            app.sendEvent(tab,event)
+        send(m.QEvent.MouseButtonPress,start.y())
+        send(m.QEvent.MouseMove,start.y()-60)
+        send(m.QEvent.MouseButtonRelease,start.y()-60)
+        self.assertEqual(self.settings.get('dock_y'),tab.geometry().top())
+        self.assertLess(tab.geometry().top(),start.y()-m.DockTab.HEIGHT//2-5)
+        send(m.QEvent.MouseButtonPress,start.y())
+        send(m.QEvent.MouseMove,start.y()-100000)
+        send(m.QEvent.MouseButtonRelease,start.y()-100000)
+        self.assertGreaterEqual(tab.geometry().top(),app.primaryScreen().availableGeometry().top())
+        self.assertFalse(window.isVisible())          # 拖动不触发展开
+        window.close()
 
 if __name__=='__main__':
     result=unittest.main(verbosity=2,exit=False)

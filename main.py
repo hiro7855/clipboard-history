@@ -36,7 +36,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QTimer, Signal, Slot, QSize, QEvent, QPoint, QObject,
-    QBuffer, QByteArray, QIODevice, QRect, QRectF
+    QBuffer, QByteArray, QIODevice, QRect, QRectF,
+    QVariantAnimation, QEasingCurve
 )
 from PySide6.QtNetwork import QLocalSocket, QLocalServer
 from PySide6.QtGui import (
@@ -47,7 +48,7 @@ from PySide6.QtGui import (
 
 # ─── Configuration ───────────────────────────────────────────
 APP_NAME = "Clipboard History"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.2"
 APP_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 DATA_DIR = os.environ.get("CLIPBOARD_HISTORY_DATA_DIR", os.path.join(APP_DIR, "data"))
 DB_PATH = os.path.join(DATA_DIR, "clips.db")
@@ -57,8 +58,9 @@ DEFAULT_SETTINGS = {
     "excluded_apps": [],
     "max_clips": 2000,
     "poll_interval_ms": 500,
-    "window_pinned": False,      # 固定在桌面：不自动隐藏，仍可拖动
+    "window_pinned": False,      # 保持显示：始终置顶；未开启时点到别处会退到被点击窗口的下一层
     "window_geometry": None,     # [x, y, w, h]，记住上次的位置和大小
+    "dock_y": None,              # 右侧小标签的纵向位置（屏幕坐标）；None 时跟随窗口中线
     "default_action": "preview",
     "paused": False,
     "hotkey": "Alt+V",
@@ -97,7 +99,9 @@ ICONS = {
     "delete": "\uE74D",
     "settings": "\uE713",
     "close": "\uE711",
+    "minimize": "\uE921",
     "search": "\uE721",
+    "paste": "\uE77F",
     "image": "\uE91B",
 }
 
@@ -109,6 +113,12 @@ _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(winty
 _user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
 _user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
 _user32.GetClipboardOwner.restype = wintypes.HWND
+# 调整 Z 序（置顶）
+_user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, wintypes.UINT]
+_user32.SetWindowPos.restype = wintypes.BOOL
+HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
 
 os.makedirs(DATA_DIR, exist_ok=True)
 logging.basicConfig(filename=os.path.join(DATA_DIR, "errors.log"), level=logging.ERROR,
@@ -941,6 +951,134 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+# ─── Dock tab（最小化后停靠在桌面右侧边的小标签）────────────────
+class DockTab(QWidget):
+    """贴着屏幕右缘的小标签：单击展开，上下拖动可换位置，悬停时微微探出。"""
+    clicked = Signal()
+    moved = Signal(int)          # 拖动结束后的新 y（屏幕坐标）
+
+    WIDTH, HOVER_WIDTH, HEIGHT = 22, 32, 84
+    DRAG_THRESHOLD = 4
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        # NoActivate：点标签不抢前台，展开时才能记住“之前那个窗口”
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                            | Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("展开历史剪贴板")
+        self.setMouseTracking(True)
+        self._edge = 0               # 标签贴靠的屏幕右缘 x（不含）
+        self._top = 0
+        self._press = None
+        self._dragging = False
+        self._hover_anim = QVariantAnimation(self)
+        self._hover_anim.setDuration(140)
+        self._hover_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._hover_anim.valueChanged.connect(lambda width: self._apply(int(width)))
+        self._apply(self.WIDTH)
+
+    def rect_at(self, edge, top, width=None):
+        return QRect(edge - (width or self.WIDTH), top, width or self.WIDTH, self.HEIGHT)
+
+    def dock_to(self, edge, top):
+        self._edge, self._top = edge, top
+        self._apply(self.width() if self.isVisible() else self.WIDTH)
+
+    def _apply(self, width):
+        self.setGeometry(self.rect_at(self._edge, self._top, width))
+
+    def enterEvent(self, event):
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self.width())
+        self._hover_anim.setEndValue(self.HOVER_WIDTH)
+        self._hover_anim.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if not self._dragging:
+            self._shrink()
+        super().leaveEvent(event)
+
+    def _shrink(self):
+        self._hover_anim.stop()
+        self._hover_anim.setStartValue(self.width())
+        self._hover_anim.setEndValue(self.WIDTH)
+        self._hover_anim.start()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._press = (event.globalPosition().toPoint(), self._top)
+            self._dragging = False
+
+    def mouseMoveEvent(self, event):
+        if self._press is None:
+            return
+        origin, top = self._press
+        delta = event.globalPosition().toPoint().y() - origin.y()
+        if not self._dragging and abs(delta) >= self.DRAG_THRESHOLD:
+            self._dragging = True
+        if self._dragging:
+            screen = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
+            avail = screen.availableGeometry()
+            self._top = max(avail.top() + 8, min(avail.bottom() - self.HEIGHT - 8, top + delta))
+            self._apply(self.width())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton or self._press is None:
+            return
+        dragged, self._press, self._dragging = self._dragging, None, False
+        if dragged:
+            self.moved.emit(self._top)
+        else:
+            self.clicked.emit()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # 同主窗口：alpha=1 的底，保证透明区域也能接到鼠标
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
+        radius = self.WIDTH / 2
+        # 右侧多画一个圆角的宽度再被屏幕边缘裁掉，视觉上只有左侧是圆的
+        body = QRectF(0.5, 0.5, self.width() + radius, self.height() - 1)
+        painter.setBrush(QColor(255, 255, 255, 245))
+        painter.setPen(QColor(0, 0, 0, 36))
+        painter.drawRoundedRect(body, radius, radius)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(COLORS["accent"]))
+        painter.drawRoundedRect(QRectF(self.width() - 4, self.height() / 2 - 14, 4, 28), 2, 2)
+        font = QFont(icon_font_family())
+        font.setPixelSize(13)
+        painter.setFont(font)
+        painter.setPen(QColor(COLORS["text_secondary"]))
+        painter.drawText(QRect(0, 0, self.width() - 6, self.height()), Qt.AlignCenter, ICONS["paste"])
+        painter.end()
+
+
+class ScaleOverlay(QWidget):
+    """缩放动画用的一层透明窗口：把窗口截图按当前矩形缩放绘制，类似 macOS 的最小化/还原。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                            | Qt.WindowDoesNotAcceptFocus | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.pixmap = QPixmap()
+
+    def paintEvent(self, event):
+        if self.pixmap.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(self.rect(), self.pixmap)
+        painter.end()
+
+
 # ─── Main Window ──────────────────────────────────────────────
 class MainWindow(QWidget):
     WM_HOTKEY = 0x0312
@@ -965,6 +1103,18 @@ class MainWindow(QWidget):
         self._loading = False
         self._pending_paste = None
         self._hotkey_id = self.HOTKEY_ID
+        self._was_active = False     # 本次显示后是否被激活过（没激活过就不会因失去激活而自动收起）
+        self._auto_docked_at = 0.0
+        self._docked = False         # 已最小化到右侧边小标签（含收起/展开动画进行中）
+        self._dock_mode = None       # 动画进行中为 "min" / "expand"
+        self._dock_anim = None
+        self.dock_tab = DockTab()
+        self.dock_tab.clicked.connect(self._show_front)
+        self.dock_tab.moved.connect(lambda y: self.settings.set("dock_y", y))
+        self._scale_overlay = ScaleOverlay()
+        # 提前创建原生窗口，第一次缩放时不会因为建窗耗时而卡顿 / 闪一下
+        self.dock_tab.winId()
+        self._scale_overlay.winId()
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -992,7 +1142,7 @@ class MainWindow(QWidget):
         self.load_clips()
 
         # Shortcut: Escape to hide
-        QShortcut(QKeySequence(Qt.Key_Escape), self, self.hide)
+        QShortcut(QKeySequence(Qt.Key_Escape), self, self._minimize_to_dock)
         QShortcut(QKeySequence("Ctrl+F"), self, lambda: self.search_input.setFocus())
         self.search_input.installEventFilter(self)
         for sequence, callback in (("Down", lambda: self._select_delta(1)),
@@ -1054,20 +1204,163 @@ class MainWindow(QWidget):
         return False, 0
 
     def _toggle_show(self):
-        if self.isVisible():
-            self.hide()
+        # 显示着且在前台（或已固定）就收进右侧边小标签，否则（含已停靠）展开到最前
+        if self.isVisible() and (self.pinned or self.isActiveWindow()):
+            self._minimize_to_dock()
         else:
-            # 呼出前先记下当前前台窗口，固定模式粘贴时要还给它
-            self._track_foreground()
-            if not self._geometry_restored:
-                self._restore_geometry()
-                self._geometry_restored = True
-            self.show()
-            self.activateWindow()
-            self.raise_()
-            self.search_input.setFocus()
+            self._show_front()
+
+    def _toggle_from_tray(self):
+        # 点托盘的瞬间窗口已因失去激活自动收起，这一下点击就是“隐藏”，不能再把它弹出来
+        if self._docked and time.monotonic() - self._auto_docked_at < 0.8:
+            return
+        if self.isVisible():
+            self._minimize_to_dock()
+        else:
+            self._show_front()
+
+    def _show_front(self, reload=True):
+        if self._docked:
+            if self._dock_mode == "expand":
+                return
+            if self._dock_mode is None:
+                self._expand_from_dock()
+                return
+            self._cancel_dock_anim()     # 收起动画没播完就被呼出：不再等动画，直接显示
+        was_hidden = not self.isVisible()
+        # 呼出前先记下当前前台窗口，固定模式粘贴时要还给它
+        self._track_foreground()
+        if not self._geometry_restored:
+            self._restore_geometry()
+            self._geometry_restored = True
+        self.show()
+        self._set_topmost(True)
+        self.activateWindow()
+        self.raise_()
+        self.search_input.setFocus()
+        if was_hidden and reload:
             self.search_input.clear()
             self.load_clips("", reset=True)
+
+    # ── 最小化到右侧边小标签：类似 macOS 的缩放动画 ──
+    DOCK_MS = 300
+
+    def _dock_position(self):
+        """小标签贴靠的屏幕右缘 x 与顶部 y：默认跟随窗口中线，拖动过标签后记住位置。"""
+        screen = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        saved = self.settings.get("dock_y")
+        top = saved if isinstance(saved, int) else self.geometry().center().y() - DockTab.HEIGHT // 2
+        top = max(avail.top() + 8, min(avail.bottom() - DockTab.HEIGHT - 8, top))
+        return avail.right() + 1, top
+
+    def _minimize_to_dock(self):
+        if not self.isVisible() or self._dock_mode:
+            return
+        window_rect = self.geometry()
+        pixmap = self.grab()
+        edge, top = self._dock_position()
+        self.dock_tab.dock_to(edge, top)
+        self._docked = True
+        self._run_dock_anim("min", pixmap, window_rect, self.dock_tab.rect_at(edge, top))
+
+    def _expand_from_dock(self):
+        tab_rect = self.dock_tab.rect_at(self.dock_tab._edge, self.dock_tab._top)
+        # 窗口内容先刷新好再截图，动画结束时和真实窗口一模一样
+        self.search_input.clear()
+        self.load_clips("", reset=True)
+        self._run_dock_anim("expand", self.grab(), self.geometry(), tab_rect)
+
+    def _run_dock_anim(self, mode, pixmap, window_rect, tab_rect):
+        self._dock_mode = mode
+        overlay = self._scale_overlay
+        overlay.pixmap = pixmap
+        overlay.setGeometry(window_rect if mode == "min" else tab_rect)
+        overlay.setWindowOpacity(1.0 if mode == "min" else 0.0)
+        overlay.show()
+        overlay.raise_()
+        if mode == "min":
+            self.dock_tab.setWindowOpacity(0.0)
+            self.dock_tab.show()
+            self.dock_tab.raise_()
+            # 截图层先实际画出来，再藏真实窗口；顺序反了中间会有一帧空白，看起来像闪一下
+            overlay.repaint()
+            self.hide()
+
+        def lerp(a, b, p):
+            return round(a + (b - a) * p)
+
+        def step(value):
+            # collapse：0 = 完整窗口，1 = 缩成小标签；标签和窗口截图在 0.6~1 之间交叉淡入淡出
+            collapse = value if mode == "min" else 1.0 - value
+            overlay.setGeometry(QRect(*(lerp(getattr(window_rect, name)(), getattr(tab_rect, name)(), collapse)
+                                        for name in ("x", "y", "width", "height"))))
+            fade = max(0.0, (collapse - 0.6) / 0.4)
+            overlay.setWindowOpacity(1.0 - fade)
+            self.dock_tab.setWindowOpacity(fade)
+            if mode == "expand" and fade == 0.0 and self.dock_tab.isVisible():
+                self.dock_tab.hide()
+
+        anim = QVariantAnimation(self)
+        anim.setDuration(self.DOCK_MS)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.InOutCubic if mode == "min" else QEasingCurve.OutCubic)
+        anim.valueChanged.connect(step)
+        anim.finished.connect(lambda: self._finish_dock_anim(mode))
+        self._dock_anim = anim
+        anim.start()
+
+    def _finish_dock_anim(self, mode):
+        anim, self._dock_anim = self._dock_anim, None
+        self._dock_mode = None
+        if anim is not None:
+            anim.deleteLater()
+        self.dock_tab.setWindowOpacity(1.0)
+        if mode == "min":
+            self._scale_overlay.hide()
+            return
+        self._docked = False
+        self.dock_tab.hide()
+        self._show_front(reload=False)
+        self.repaint()
+        # 真实窗口画出第一帧后再撤掉截图，避免闪一下
+        QTimer.singleShot(90, lambda: None if self._dock_mode else self._scale_overlay.hide())
+
+    def _cancel_dock_anim(self):
+        anim, self._dock_anim = self._dock_anim, None
+        if anim is not None:
+            anim.stop()
+            anim.deleteLater()
+        self._dock_mode = None
+        self._docked = False
+        self._scale_overlay.hide()
+        self.dock_tab.setWindowOpacity(1.0)
+        self.dock_tab.hide()
+
+    # ── 退出：监听在本进程内，退出后不再记录 ──
+    def _confirm_quit(self):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("退出历史剪贴板")
+        box.setText("退出后将不再记录复制的内容。")
+        box.setInformativeText("只想收起窗口并继续记录，请点右上角的“最小化”。")
+        quit_button = box.addButton("退出", QMessageBox.AcceptRole)
+        cancel_button = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is quit_button
+
+    def _request_quit(self):
+        if self._confirm_quit():
+            QApplication.quit()
+
+    # ── Z 序：置顶 ──
+    def _set_topmost(self, topmost):
+        # 直接改 Z 序而不是 setWindowFlags：后者会重建原生窗口，Alt+V 热键随旧句柄失效
+        _user32.SetWindowPos(int(self.winId()), HWND_TOPMOST if topmost else HWND_NOTOPMOST,
+                             0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
     # ── 位置 / 大小记忆 ──
     def _restore_geometry(self):
@@ -1103,13 +1396,15 @@ class MainWindow(QWidget):
         self.pinned = not self.pinned
         self.settings.set("window_pinned", self.pinned)
         self._update_pin_button()
+        if self.pinned and self.isVisible():
+            self._set_topmost(True)
 
     def _update_pin_button(self):
         self.pin_btn.set_state("pinned" if self.pinned else "pin", self.pinned)
         if self.pinned:
-            self.pin_btn.setToolTip("保持显示：置顶且不自动隐藏，可拖动标题栏\n点击恢复自动隐藏")
+            self.pin_btn.setToolTip("保持显示：始终置顶，点到别处也不收起\n点击恢复：点到别处时自动收进右侧边小标签")
         else:
-            self.pin_btn.setToolTip("保持显示（置顶且不自动隐藏）")
+            self.pin_btn.setToolTip("保持显示（始终置顶）\n未开启时，点到别处会自动收进右侧边小标签")
         self.title_bar.setCursor(Qt.SizeAllCursor)
 
     def _track_foreground(self):
@@ -1127,17 +1422,32 @@ class MainWindow(QWidget):
         super().showEvent(event)
 
     def hideEvent(self, event):
+        self._was_active = False
         self._foreground_timer.stop()
         super().hideEvent(event)
 
     def changeEvent(self, event):
-        # 未固定时：窗口失去激活（点了别处）就自动隐藏；
-        # 有模态对话框（如设置）打开时不隐藏
-        if (event.type() == QEvent.ActivationChange and not self.isActiveWindow()
-                and not self.pinned and self.isVisible()
-                and QApplication.activeModalWidget() is None):
-            self.hide()
+        # 未固定时：窗口失去激活（点了别处）就自动收进右侧边小标签
+        if event.type() == QEvent.ActivationChange and self.isVisible() and not self._dock_mode:
+            if self.isActiveWindow():
+                self._was_active = True
+            elif self._was_active and not self.pinned:
+                # 点击瞬间前台窗口可能还没切换完，稍等再判断
+                QTimer.singleShot(80, self._dock_if_deactivated)
         super().changeEvent(event)
+
+    def _dock_if_deactivated(self):
+        # 模态对话框（设置 / 预览 / 退出确认）、右键菜单打开，或窗口已重新激活时不动
+        if (self.pinned or not self.isVisible() or self.isActiveWindow() or self._dock_mode
+                or QApplication.activeModalWidget() is not None
+                or QApplication.activePopupWidget() is not None):
+            return
+        pid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(_user32.GetForegroundWindow(), ctypes.byref(pid))
+        if pid.value == os.getpid():
+            return
+        self._auto_docked_at = time.monotonic()
+        self._minimize_to_dock()
 
     # ── 无边框窗口的拖动与缩放 ──
     def eventFilter(self, obj, event):
@@ -1257,9 +1567,13 @@ class MainWindow(QWidget):
         settings_btn.clicked.connect(self._open_settings)
         title_layout.addWidget(settings_btn)
 
-        close_btn = IconButton("close", "titleBtn", "隐藏（Esc / Alt+V）")
-        close_btn.clicked.connect(self._toggle_show)
-        title_layout.addWidget(close_btn)
+        self.minimize_btn = IconButton("minimize", "titleBtn", "最小化到桌面右侧边的小标签，继续记录（单击标签、托盘图标或 Alt+V 呼出）")
+        self.minimize_btn.clicked.connect(self._minimize_to_dock)
+        title_layout.addWidget(self.minimize_btn)
+
+        self.close_btn = IconButton("close", "titleBtn", "退出程序（退出后不再记录复制内容）")
+        self.close_btn.clicked.connect(self._request_quit)
+        title_layout.addWidget(self.close_btn)
 
         layout.addWidget(self.title_bar)
 
@@ -1637,7 +1951,7 @@ class MainWindow(QWidget):
         sequence = _user32.GetClipboardSequenceNumber()
         self._pending_paste = (hwnd, pid, sequence)
         if not self.pinned:
-            self.hide()
+            self._minimize_to_dock()
         QTimer.singleShot(80, self._simulate_paste)
 
     def _simulate_paste(self):
@@ -1863,7 +2177,7 @@ def create_tray_icon(app, window):
     icon = create_app_icon()
 
     tray = QSystemTrayIcon(icon, app)
-    tray.setToolTip(APP_NAME)
+    tray.setToolTip(f"{APP_NAME}（单击显示/隐藏）")
 
     menu = QMenu()
     # 透明底 + 无系统阴影，圆角外面才不会露出直角
@@ -1885,7 +2199,7 @@ def create_tray_icon(app, window):
     # QAction 必须挂父对象、菜单必须有人持有引用：
     # 否则函数一返回就被 Python 回收，右键菜单里只剩分隔线
     show_action = QAction("显示/隐藏", menu)
-    show_action.triggered.connect(window._toggle_show)
+    show_action.triggered.connect(window._toggle_from_tray)
     menu.addAction(show_action)
     pause_action = QAction("暂停记录", menu)
     pause_action.triggered.connect(window._toggle_pause)
@@ -1903,7 +2217,8 @@ def create_tray_icon(app, window):
 
     tray.setContextMenu(menu)
     tray._menu = menu
-    tray.activated.connect(lambda reason: window._toggle_show() if reason == QSystemTrayIcon.DoubleClick else None)
+    # 单击托盘图标显示/隐藏（双击在 Windows 上也只会先触发一次单击，这里不再重复处理）
+    tray.activated.connect(lambda reason: window._toggle_from_tray() if reason == QSystemTrayIcon.Trigger else None)
 
     tray.show()
     return tray
@@ -1943,9 +2258,9 @@ def main():
         conn = server.nextPendingConnection()
         if conn is not None:
             conn.disconnectFromServer()
-        # 唤起已运行实例的窗口
-        if not window.isVisible():
-            window._toggle_show()
+        # 唤起已运行实例的窗口（被压在后面时也带回最前）
+        if not window.isVisible() or not window.isActiveWindow():
+            window._show_front()
 
     server.newConnection.connect(_on_second_instance)
 
